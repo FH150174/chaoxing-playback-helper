@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通视频与 PPT 连播助手
 // @namespace    local.chaoxing.playback
-// @version      0.3.1
+// @version      0.3.2
 // @description  顺序处理视频、PPT 与章节习题任务，等待平台完成标记后切换。
 // @homepageURL  https://github.com/FH150174/chaoxing-playback-helper
 // @supportURL   https://github.com/FH150174/chaoxing-playback-helper/issues
@@ -22,7 +22,7 @@
   'use strict';
 
   const ROOT_PATH = /\/mycourse\/studentstudy\/?$/;
-  const QUIZ_PATH = /\/(?:mooc-ans\/work\/(?:doHomeWorkNew|selectWorkQuestion)|mooc2\/work\/task|ananas\/modules\/work\/)/i;
+  const QUIZ_PATH = /\/(?:(?:mooc-ans\/)?work\/(?:doHomeWorkNew|selectWorkQuestion[^/]*)|(?:mooc-ans\/)?mooc2\/work\/(?:dowork|task)|ananas\/modules\/work\/)/i;
   const QUIZ_CHANNEL = 'cxpb-quiz-v1';
   const API_KEY_NAME = 'cxpb-deepseek-api-key';
   const MODEL_NAME = 'cxpb-deepseek-model';
@@ -160,6 +160,12 @@
     setStatus(message);
   }
 
+  function pauseQuizTask(message) {
+    if (!quizState) return;
+    quizState.error = String(message || '未知错误').slice(0, 120);
+    setStatus('习题暂无法自动处理：' + quizState.error + '；连播保持开启，停在当前任务点。');
+  }
+
   window.addEventListener('message', (event) => {
     if (!quizState || !/^https:\/\/(?:[^.]+\.)*chaoxing\.com$/.test(event.origin)) return;
     const data = event.data;
@@ -167,7 +173,7 @@
         data.token !== quizState.token) return;
     quizState.messageAt = Date.now();
     if (data.kind === 'error') {
-      stop('习题处理停止：' + String(data.message || '未知错误').slice(0, 120));
+      pauseQuizTask(data.message);
     } else if (data.kind === 'submitted') {
       quizState.submitted = true;
       quizState.submittedAt = Date.now();
@@ -611,14 +617,15 @@
     }
     if (quizState && !quizState.element.isConnected) cancelQuizTask();
     if (quizState && quizState.element.isConnected) {
-      if (quizState.submitted) {
-        if (quizState.element.classList.contains('ans-job-finished')) cancelQuizTask();
-        else {
-          if (Date.now() - quizState.submittedAt > 90000) {
-            stop('习题已提交，但平台仍未显示任务完成。请手动检查结果。');
-          } else setStatus('习题已提交，等待平台显示任务完成…');
-          return;
-        }
+      if (quizState.element.classList.contains('ans-job-finished')) cancelQuizTask();
+      else if (quizState.error) {
+        pauseQuizTask(quizState.error);
+        return;
+      } else if (quizState.submitted) {
+        if (Date.now() - quizState.submittedAt > 90000) {
+          pauseQuizTask('习题已提交，但平台仍未显示任务完成。请手动检查结果。');
+        } else setStatus('习题已提交，等待平台显示任务完成…');
+        return;
       } else {
         processQuizTask({ element: quizState.element });
         return;
@@ -766,16 +773,16 @@
   function findQuizFrame(host) {
     for (const frame of host.querySelectorAll('iframe')) {
       try {
-        const url = new URL(frame.src, frame.ownerDocument.baseURI);
-        if (/^(?:[^.]+\.)*chaoxing\.com$/i.test(url.hostname) &&
-            QUIZ_PATH.test(url.pathname) && frame.contentWindow) return frame;
-      } catch { /* 非法或尚未加载的框架地址。 */ }
-      try {
         if (frame.contentDocument) {
           const nested = findQuizFrame(frame.contentDocument);
           if (nested) return nested;
         }
       } catch { /* 跨域中间框架不可访问。 */ }
+      try {
+        const url = new URL(frame.src, frame.ownerDocument.baseURI);
+        if (/^(?:[^.]+\.)*chaoxing\.com$/i.test(url.hostname) &&
+            QUIZ_PATH.test(url.pathname) && frame.contentWindow) return frame;
+      } catch { /* 非法或尚未加载的框架地址。 */ }
     }
     return null;
   }
@@ -789,20 +796,22 @@
         startedAt: now,
         messageAt: now,
         submitted: false,
+        error: null,
         frame: null
       };
       GM_setValue(quizSessionKey, { token: quizState.token, createdAt: now });
     }
+    if (quizState.error) return;
     const frame = findQuizFrame(job.element);
     if (!frame) {
       if (now - quizState.startedAt > 25000) {
-        stop('未找到可访问的章节习题框架，请检查题目是否加载。');
+        pauseQuizTask('未找到可访问的章节习题框架，请检查题目是否加载。');
       } else setStatus('正在等待章节习题页面加载…');
       return;
     }
     quizState.frame = frame.contentWindow;
     if (now - quizState.startedAt > 60 * 60 * 1000) {
-      stop('章节习题处理超过一小时，请手动检查。');
+      pauseQuizTask('章节习题处理超过一小时，请手动检查。');
       return;
     }
     frame.contentWindow.postMessage({
@@ -821,12 +830,13 @@
   }
 
   function parseQuizQuestions(doc) {
-    const roots = Array.from(doc.querySelectorAll('div.singleQuesId, .questionLi, div[id^="question"]'))
+    const roots = Array.from(doc.querySelectorAll('div.singleQuesId, .questionLi, div[id^="question"], .TiMu'))
       .filter((node) => visible(node) &&
         (!node.matches('.questionLi') || !node.closest('.singleQuesId')) &&
-        (node.matches('.singleQuesId, .questionLi') ||
-          (!node.closest('.singleQuesId') &&
-            !node.querySelector('div.singleQuesId, .questionLi, div[id^="question"]'))));
+        (!node.matches('.TiMu') || !node.closest('.singleQuesId, .questionLi')) &&
+        (node.matches('.singleQuesId, .questionLi, .TiMu') ||
+          (!node.closest('.singleQuesId, .questionLi, .TiMu') &&
+            !node.querySelector('div.singleQuesId, .questionLi, div[id^="question"], .TiMu'))));
     return roots.map((node, index) => {
       if (node.querySelector('.font-cxsecret')) {
         throw new Error('第 ' + (index + 1) + ' 题使用加密字体，无法可靠读取题干。');
@@ -835,33 +845,41 @@
         throw new Error('第 ' + (index + 1) + ' 题含图片，当前版本无法可靠作答。');
       }
       const typeText = quizText(node.querySelector('.newZy_TItle, .colorShallow')?.textContent ||
-        node.getAttribute('typename') || '');
+        node.querySelector('.Zy_TItle')?.textContent || node.getAttribute('typename') || '');
       let type = /多选/.test(typeText) ? 'multi' :
         /单选|判断/.test(typeText) ? 'single' : null;
       const spans = Array.from(node.querySelectorAll('span.num_option'));
       const inputs = spans.length ? [] : Array.from(node.querySelectorAll('input[type="radio"],input[type="checkbox"]'));
+      const rows = spans.length || inputs.length ? [] :
+        Array.from(node.querySelectorAll('.Zy_ulTop > li, .Zy_ulBottom > li'));
       if (!type && inputs.length) type = inputs[0].type === 'checkbox' ? 'multi' : 'single';
       if (!type) {
         throw new Error('第 ' + (index + 1) + ' 题题型尚不支持：' + (typeText || '未知题型'));
       }
-      const controls = spans.length ? spans : inputs;
+      const controls = spans.length ? spans : inputs.length ? inputs : rows;
       const options = controls.map((control, optionIndex) => {
-        const parent = control.closest('label') || control.parentElement;
-        const displayed = quizText(control.textContent).match(/^[A-Z]/i)?.[0]?.toUpperCase();
+        const parent = control.closest('label, li, .answerBg') || control.parentElement;
+        const label = spans.length ? control.textContent : rows.length ?
+          control.querySelector('.num_option')?.textContent : '';
+        const displayed = quizText(label).match(/^[A-Z]/i)?.[0]?.toUpperCase();
         const letter = displayed || String.fromCharCode(65 + optionIndex);
-        const text = quizText(parent?.textContent).replace(/^[A-Z][.、．\s]*/i, '');
-        return { control, target: spans.length ? parent : control, letter, text };
+        const anchorText = node.matches('.TiMu') ? parent?.querySelector('a')?.textContent : null;
+        const text = anchorText ? quizText(anchorText) : quizText(parent?.textContent).replace(
+          spans.length || displayed ? new RegExp('^' + letter + '[.、．\\s]*', 'i') :
+            /^[A-Z][.、．\s]+/i, '');
+        return { control, target: parent || control, letter, text };
       });
       if (options.length < 2 || options.some((option) => !option.text) ||
           new Set(options.map((option) => option.letter)).size !== options.length) {
         throw new Error('第 ' + (index + 1) + ' 题选项无法可靠读取。');
       }
       const clone = node.cloneNode(true);
+      for (const list of clone.querySelectorAll('.Zy_ulTop, .Zy_ulBottom')) list.remove();
       for (const control of clone.querySelectorAll('span.num_option')) {
-        (control.closest('label') || control.parentElement)?.remove();
+        (control.closest('label, li, .answerBg') || control.parentElement)?.remove();
       }
       for (const control of clone.querySelectorAll('input[type="radio"],input[type="checkbox"]')) {
-        (control.closest('label') || control.parentElement)?.remove();
+        (control.closest('label, li, .answerBg') || control.parentElement)?.remove();
       }
       for (const element of clone.querySelectorAll('script,style,button,textarea,input')) element.remove();
       const stem = quizText(clone.textContent);
@@ -874,7 +892,8 @@
     return option.control.classList.contains('check_answer') ||
       option.target.classList.contains('check_answer') ||
       option.target.classList.contains('selected') ||
-      option.control.checked === true;
+      option.control.checked === true ||
+      Boolean(option.target.querySelector('input[type="radio"]:checked,input[type="checkbox"]:checked,.check_answer'));
   }
 
   function requestDeepSeek(key, model, question, pass) {
@@ -1033,7 +1052,10 @@
           await sleepQuiz(1000);
         }
         if (!questions.length) {
-          throw parseError || new Error('没有识别到选择题或判断题。');
+          const blocks = document.querySelectorAll('div.singleQuesId, .questionLi, div[id^="question"], .TiMu').length;
+          const frames = document.querySelectorAll('iframe').length;
+          throw parseError || new Error('没有识别到选择题或判断题（当前框架题目容器 ' +
+            blocks + ' 个，内嵌框架 ' + frames + ' 个）。');
         }
         if (questions.length > 50) throw new Error('题目超过 50 道，暂停以避免意外的 API 费用。');
         const isCancelled = () => cancelled ||

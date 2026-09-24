@@ -387,8 +387,8 @@ test('retries at 1x when the player rejects play at a faster rate', async () => 
   } finally { page.close(); }
 });
 
-async function runQuizFrame(questions, answerForRequest, hasKey = true) {
-  const dom = new JSDOM('<!doctype html><html><body><iframe src="/mooc-ans/work/doHomeWorkNew"></iframe></body></html>', {
+async function runQuizFrame(questions, answerForRequest, hasKey = true, framePath = '/mooc-ans/work/doHomeWorkNew') {
+  const dom = new JSDOM('<!doctype html><html><body><iframe src="' + framePath + '"></iframe></body></html>', {
     url: courseUrl, runScripts: 'outside-only', pretendToBeVisual: true
   });
   const top = dom.window;
@@ -401,10 +401,18 @@ async function runQuizFrame(questions, answerForRequest, hasKey = true) {
   let confirms = 0;
   frame.document.querySelector('#quiz-submit').addEventListener('click', () => { submits += 1; });
   frame.document.querySelector('#popok').addEventListener('click', () => { confirms += 1; });
-  for (const question of frame.document.querySelectorAll('.singleQuesId, .questionLi, div[id^="question"]')) {
+  for (const question of frame.document.querySelectorAll('.singleQuesId, .questionLi, div[id^="question"], .TiMu')) {
     for (const option of question.querySelectorAll('.quiz-option')) {
       option.addEventListener('click', () => {
-        const selected = option.querySelector('.num_option');
+        const selected = option.querySelector('.num_option, input[type="radio"], input[type="checkbox"]') || option;
+        if (selected?.tagName === 'INPUT') {
+          if (selected.type === 'checkbox') selected.checked = !selected.checked;
+          else {
+            for (const other of question.querySelectorAll('input[type="radio"]')) other.checked = false;
+            selected.checked = true;
+          }
+          return;
+        }
         if (/多选/.test(question.querySelector('.newZy_TItle')?.textContent || '')) {
           selected.classList.toggle('check_answer');
         } else {
@@ -475,6 +483,57 @@ test('sends a start command to a chapter quiz without skipping the task', async 
   } finally { page.close(); }
 });
 
+test('keeps playback enabled and waits at a quiz when parsing fails', async () => {
+  const page = await setup(fixture('<div class="ans-attach-ct"><iframe src="/mooc-ans/work/doHomeWorkNew"></iframe></div>'));
+  try {
+    const job = page.win.document.querySelector('.ans-attach-ct');
+    const frame = job.querySelector('iframe').contentWindow;
+    const commands = [];
+    frame.addEventListener('message', (event) => commands.push(event.data));
+    page.button.click();
+    await page.step();
+    await new Promise((resolve) => setImmediate(resolve));
+    const token = commands.find((command) => command.action === 'solve')?.token;
+    assert.ok(token);
+    page.win.dispatchEvent(new page.win.MessageEvent('message', {
+      source: frame,
+      origin: 'https://mooc1.chaoxing.com',
+      data: { channel: 'cxpb-quiz-v1', token, kind: 'error', message: 'no questions found' }
+    }));
+    assert.equal(page.button.textContent, '\u505c\u6b62\u8fde\u64ad');
+    assert.match(page.win.document.getElementById('cxpb-status').textContent, /no questions found/);
+    const requestCount = commands.length;
+    await page.step();
+    assert.equal(commands.length, requestCount, 'a failed quiz must not be retried every tick');
+    job.classList.add('ans-job-finished');
+    await page.step();
+    assert.equal(page.button.textContent, '\u505c\u6b62\u8fde\u64ad');
+  } finally { page.close(); }
+});
+
+test('prefers the inner quiz frame when a quiz frame embeds another quiz page', async () => {
+  let inner;
+  const page = await setup(fixture('<div class="ans-attach-ct"><iframe id="outer-quiz" src="/mooc-ans/work/doHomeWorkNew"></iframe></div>'), (win) => {
+    const outerDoc = win.document.getElementById('outer-quiz').contentDocument;
+    outerDoc.open();
+    outerDoc.write('<!doctype html><html><body><iframe src="/mooc-ans/mooc2/work/dowork"></iframe></body></html>');
+    outerDoc.close();
+    inner = outerDoc.querySelector('iframe').contentWindow;
+  });
+  try {
+    const outer = page.win.document.getElementById('outer-quiz').contentWindow;
+    const outerCommands = [];
+    const innerCommands = [];
+    outer.addEventListener('message', (event) => outerCommands.push(event.data));
+    inner.addEventListener('message', (event) => innerCommands.push(event.data));
+    page.button.click();
+    await page.step();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(innerCommands[0]?.action, 'solve');
+    assert.equal(outerCommands.length, 0);
+  } finally { page.close(); }
+});
+
 test('answers choice and judgment questions only after two matching model responses', async () => {
   const questions = [
     '<div class="singleQuesId" data="q1">',
@@ -528,6 +587,62 @@ test('recognizes the legacy question title label', async () => {
   assert.equal(result.result.kind, 'submitted');
   assert.equal(result.requests, 2);
   assert.equal(result.submits, 1);
+});
+
+test('answers legacy TiMu chapter quiz questions with input options', async () => {
+  const questions = [
+    '<div class="CeYan"><div class="TiMu"><div class="Zy_TItle clearfix"><div>\u3016\u5355\u9009\u9898\u3017Who painted this?</div></div>',
+    '<ul class="Zy_ulTop"><li class="quiz-option"><input type="radio" name="q1"><a>Wang Wei</a></li>',
+    '<li class="quiz-option"><input type="radio" name="q1"><a>Juran</a></li>',
+    '<li class="quiz-option"><input type="radio" name="q1"><a>Wu Daozi</a></li>',
+    '<li class="quiz-option"><input type="radio" name="q1"><a>Huang Gongwang</a></li></ul></div></div>'
+  ].join('');
+  const result = await runQuizFrame(questions, (question) => {
+    assert.match(question.question, /Who painted this/);
+    assert.deepEqual(question.options.map((option) => option.text), ['Wang Wei', 'Juran', 'Wu Daozi', 'Huang Gongwang']);
+    return { answer: ['D'], confidence: 'high' };
+  }, true, '/mooc-ans/mooc2/work/dowork');
+  assert.equal(result.result.kind, 'submitted', result.result.message);
+  assert.equal(result.requests, 2);
+  assert.equal(result.submits, 1);
+});
+
+test('answers legacy TiMu judgment questions with input options', async () => {
+  const questions = [
+    '<div class="CeYan"><div class="TiMu"><div class="Zy_TItle clearfix"><div>\u3016\u5224\u65ad\u9898\u3017The sun rises in the east.</div></div>',
+    '<ul class="Zy_ulBottom"><li class="quiz-option"><input type="radio" name="q2"><a>True</a></li>',
+    '<li class="quiz-option"><input type="radio" name="q2"><a>False</a></li></ul></div></div>'
+  ].join('');
+  const result = await runQuizFrame(questions, (question) => {
+    assert.equal(question.type, 'single');
+    assert.deepEqual(question.options.map((option) => option.text), ['True', 'False']);
+    return { answer: ['A'], confidence: 'high' };
+  });
+  assert.equal(result.result.kind, 'submitted', result.result.message);
+  assert.equal(result.requests, 2);
+  assert.equal(result.submits, 1);
+});
+
+test('answers legacy TiMu options rendered as clickable rows without input elements', async () => {
+  const questions = [
+    '<div class="TiMu"><div class="Zy_TItle clearfix"><div>\u3016\u5355\u9009\u9898\u3017Which is correct?</div></div>',
+    '<ul class="Zy_ulTop"><li class="quiz-option"><a>Apple</a></li>',
+    '<li class="quiz-option"><a>Banana</a></li></ul></div>'
+  ].join('');
+  const result = await runQuizFrame(questions, (question) => {
+    assert.deepEqual(question.options.map((option) => option.text), ['Apple', 'Banana']);
+    return { answer: ['B'], confidence: 'high' };
+  });
+  assert.equal(result.result.kind, 'submitted', result.result.message);
+  assert.equal(result.submits, 1);
+});
+
+test('reports structural counts when a quiz frame has no recognizable questions', async () => {
+  const result = await runQuizFrame('', () => ({ answer: ['A'], confidence: 'high' }));
+  assert.equal(result.result.kind, 'error');
+  assert.match(result.result.message, /0 \u4e2a/);
+  assert.equal(result.requests, 0);
+  assert.equal(result.submits, 0);
 });
 
 test('does not submit when two model passes disagree', async () => {
