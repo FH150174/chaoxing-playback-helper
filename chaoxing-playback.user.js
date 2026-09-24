@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通视频与 PPT 连播助手
 // @namespace    local.chaoxing.playback
-// @version      0.2.2
+// @version      0.2.3
 // @description  顺序处理未完成的视频与 PPT 任务，等待平台完成标记后切换。
 // @homepageURL  https://github.com/FH150174/chaoxing-playback-helper
 // @supportURL   https://github.com/FH150174/chaoxing-playback-helper/issues
@@ -48,6 +48,7 @@
   const observedDocs = new WeakSet();
   const guardedDocs = new WeakSet();
   const watchedMedia = new WeakSet();
+  const mediaSpeedStates = new WeakMap();
   let lastStatus = '';
 
   function readSettings() {
@@ -110,15 +111,6 @@
     doc.defaultView.addEventListener('blur', (event) => {
       const settings = readSettings();
       if (settings.enabled && settings.background) event.stopImmediatePropagation();
-    }, true);
-    // 部分课程的播放器在 ratechange 时恢复 1× 并暂停；只屏蔽当前任务媒体的倍速回调。
-    doc.addEventListener('ratechange', (event) => {
-      const settings = readSettings();
-      const media = event.target;
-      if (settings.enabled && settings.speed > 1 && watchedMedia.has(media) &&
-          Math.abs(media.playbackRate - settings.speed) < 0.01) {
-        event.stopImmediatePropagation();
-      }
     }, true);
   }
 
@@ -553,11 +545,79 @@
     const media = pending.media;
     if (!watchedMedia.has(media)) {
       watchedMedia.add(media);
+      mediaSpeedStates.set(media, {
+        configuredSpeed: null,
+        requestedFast: false,
+        requestedAt: 0,
+        limited: false,
+        pauseCount: 0,
+        lastPauseAt: 0
+      });
       media.addEventListener('ended', tick, { once: true });
+      media.addEventListener('ratechange', () => {
+        const state = mediaSpeedStates.get(media);
+        const settings = readSettings();
+        if (!settings.enabled || settings.speed <= 1 || !state?.requestedFast || state.limited) return;
+        if (media.playbackRate < state.configuredSpeed - 0.01) {
+          state.limited = true;
+          setStatus('当前视频不允许所选倍速，已改用 1×。');
+        }
+      });
+      media.addEventListener('pause', () => {
+        const state = mediaSpeedStates.get(media);
+        const settings = readSettings();
+        if (!settings.enabled || settings.speed <= 1 || !state?.requestedFast || state.limited || media.ended) return;
+        const now = Date.now();
+        state.pauseCount = now - state.lastPauseAt <= 10000 ? state.pauseCount + 1 : 1;
+        state.lastPauseAt = now;
+        if (now - state.requestedAt <= 5000 || state.pauseCount >= 2) {
+          state.limited = true;
+          setStatus('当前视频在倍速下自动暂停，已改用 1×。');
+        }
+      });
     }
     const settings = readSettings();
+    const speedState = mediaSpeedStates.get(media);
+    if (speedState.configuredSpeed !== settings.speed) {
+      speedState.configuredSpeed = settings.speed;
+      speedState.requestedFast = false;
+      speedState.limited = false;
+      speedState.pauseCount = 0;
+    }
+    const speedNotice = (pending.element.textContent || '') +
+      (media.closest('.ans-attach-ct')?.textContent || '');
+    if (settings.speed > 1 && /(?:不可|不允许|禁止|不能)倍速/.test(speedNotice)) {
+      speedState.limited = true;
+    }
+    if (settings.speed > 1 && speedState.requestedFast &&
+        media.playbackRate < settings.speed - 0.01) {
+      speedState.limited = true;
+    }
     if (media.muted !== settings.muted) media.muted = settings.muted;
-    if (Math.abs(media.playbackRate - settings.speed) > 0.01) media.playbackRate = settings.speed;
+    let targetSpeed = speedState.limited ? 1 : settings.speed;
+    if (Math.abs(media.playbackRate - targetSpeed) > 0.01) {
+      try {
+        if (targetSpeed > 1) {
+          speedState.requestedFast = true;
+          speedState.requestedAt = Date.now();
+        }
+        media.playbackRate = targetSpeed;
+      } catch {
+        if (targetSpeed <= 1) {
+          stop('播放器拒绝了原速播放，请手动检查。');
+          return;
+        }
+        speedState.limited = true;
+        targetSpeed = 1;
+      }
+    }
+    if (speedState.limited && Math.abs(media.playbackRate - 1) > 0.01) {
+      try { media.playbackRate = 1; }
+      catch {
+        stop('播放器拒绝了原速播放，请手动检查。');
+        return;
+      }
+    }
     if (media.ended) {
       if (!endedAt) endedAt = Date.now();
       if (Date.now() - endedAt > 90000) stop('视频已播放完，但平台还没有显示任务完成。');
@@ -576,12 +636,24 @@
     if (!stallAt) stallAt = now;
     if (media.paused) {
       try { await media.play(); }
-      catch (error) {
-        stop('浏览器阻止了自动播放，请在视频上手动点击播放后重新开始。');
-        return;
+      catch {
+        if (settings.speed > 1 && !speedState.limited) {
+          speedState.limited = true;
+          try {
+            media.playbackRate = 1;
+            await media.play();
+          } catch {
+            stop('浏览器或课程阻止了自动播放，请手动播放后重新开始。');
+            return;
+          }
+        } else {
+          stop('浏览器或课程阻止了自动播放，请手动播放后重新开始。');
+          return;
+        }
       }
     }
-    setStatus('正在播放当前未完成视频：' + Math.floor(media.currentTime) + ' 秒，' + settings.speed + '×');
+    const speedLabel = speedState.limited ? '1×（课程限制）' : media.playbackRate + '×';
+    setStatus('正在播放当前未完成视频：' + Math.floor(media.currentTime) + ' 秒，' + speedLabel);
   }
 
   function tick() {

@@ -26,6 +26,7 @@ async function setup(html, beforeScript) {
   win.Date.now = () => now;
   win.setInterval = (fn) => { interval = fn; return 1; };
   win.console.info = () => {};
+  win.__setPaused = (value) => { paused = value; };
   const video = win.document.querySelector('video');
   if (video) {
     Object.defineProperty(video, 'paused', { configurable: true, get: () => paused });
@@ -246,13 +247,17 @@ test('recognizes the insertdoc-online PPT marker and scrolls through a second if
     assert.equal(ppt.getPosition(), 160);
   } finally { ppt.page.close(); }
 });
-test('keeps 2x playback when a course resets speed and pauses on ratechange', async () => {
-  let blockedPauses = 0;
+test('falls back to 1x when the course resets the requested rate and pauses', async () => {
+  let denied = 0;
   const page = await setup(fixture('<div class="ans-attach-ct"><video></video></div>'), (win) => {
     const video = win.document.querySelector('video');
-    video.pause = () => { blockedPauses += 1; };
+    video.pause = () => {
+      win.__setPaused(true);
+      video.dispatchEvent(new win.Event('pause'));
+    };
     video.addEventListener('ratechange', () => {
       if (video.playbackRate > 1) {
+        denied += 1;
         video.playbackRate = 1;
         video.pause();
       }
@@ -262,17 +267,70 @@ test('keeps 2x playback when a course resets speed and pauses on ratechange', as
     page.button.click();
     await page.step();
     page.video.dispatchEvent(new page.win.Event('ratechange'));
-    assert.equal(page.video.playbackRate, 2);
-    assert.equal(blockedPauses, 0, 'the course ratechange handler should not pause the active task');
-
-    page.button.click();
-    page.video.dispatchEvent(new page.win.Event('ratechange'));
-    assert.equal(blockedPauses, 1, 'the course listener should work again after stopping');
+    await page.step();
+    assert.equal(page.video.playbackRate, 1);
+    assert.equal(page.video.paused, false, 'the video should resume at normal speed');
+    assert.match(page.win.document.getElementById('cxpb-status').textContent, /1×.*课程限制/);
+    const deniedBefore = denied;
+    await page.step();
+    assert.equal(denied, deniedBefore, 'the helper must not retry 2x on this video');
   } finally { page.close(); }
 });
-test('guards 2x playback inside a chapter iframe', async () => {
+
+test('falls back to 1x when the course pauses without resetting the rate', async () => {
+  let pauses = 0;
+  const page = await setup(fixture('<div class="ans-attach-ct"><video></video></div>'), (win) => {
+    const video = win.document.querySelector('video');
+    video.pause = () => {
+      pauses += 1;
+      win.__setPaused(true);
+      video.dispatchEvent(new win.Event('pause'));
+    };
+    video.addEventListener('ratechange', () => {
+      if (video.playbackRate > 1) video.pause();
+    });
+  });
+  try {
+    page.button.click();
+    await page.step();
+    page.video.dispatchEvent(new page.win.Event('ratechange'));
+    await page.step();
+    assert.equal(page.video.playbackRate, 1);
+    assert.equal(page.video.paused, false);
+    assert.ok(pauses >= 1);
+    const pausesBefore = pauses;
+    await page.step();
+    assert.equal(pauses, pausesBefore, 'the helper must not retrigger a speed-related pause');
+  } finally { page.close(); }
+});
+
+test('uses the selected fast rate again on the next unrestricted video', async () => {
+  let first;
+  let second;
+  const page = await setup(fixture('<div class="ans-attach-ct" id="first"><video></video></div><div class="ans-attach-ct" id="second"><video></video></div>'), (win) => {
+    first = win.document.querySelector('#first video');
+    second = win.document.querySelector('#second video');
+    Object.defineProperty(second, 'paused', { get: () => false });
+    first.addEventListener('ratechange', () => {
+      if (first.playbackRate > 1) first.playbackRate = 1;
+    });
+  });
+  try {
+    page.button.click();
+    await page.step();
+    first.dispatchEvent(new page.win.Event('ratechange'));
+    await page.step();
+    assert.equal(first.playbackRate, 1);
+    page.win.document.getElementById('first').classList.add('ans-job-finished');
+    await new Promise((resolve) => setImmediate(resolve));
+    await page.step();
+    assert.equal(second.playbackRate, 2);
+  } finally { page.close(); }
+});
+
+test('falls back to 1x for restricted media inside a chapter iframe', async () => {
   let frameVideo;
-  let courseResets = 0;
+  let resets = 0;
   const page = await setup(fixture('<iframe id="video-frame"></iframe>'), (win) => {
     const frameDoc = win.document.getElementById('video-frame').contentDocument;
     frameDoc.body.innerHTML = '<div class="ans-attach-ct"><video></video></div>';
@@ -280,7 +338,7 @@ test('guards 2x playback inside a chapter iframe', async () => {
     Object.defineProperty(frameVideo, 'paused', { get: () => false });
     frameVideo.addEventListener('ratechange', () => {
       if (frameVideo.playbackRate > 1) {
-        courseResets += 1;
+        resets += 1;
         frameVideo.playbackRate = 1;
       }
     });
@@ -288,8 +346,39 @@ test('guards 2x playback inside a chapter iframe', async () => {
   try {
     page.button.click();
     await page.step();
-    frameVideo.dispatchEvent(new page.win.Event('ratechange'));
-    assert.equal(frameVideo.playbackRate, 2);
-    assert.equal(courseResets, 0);
+    frameVideo.dispatchEvent(new frameVideo.ownerDocument.defaultView.Event('ratechange'));
+    await page.step();
+    assert.equal(frameVideo.playbackRate, 1);
+    const resetCount = resets;
+    await page.step();
+    assert.equal(resets, resetCount);
+  } finally { page.close(); }
+});
+test('starts a task at 1x when its page explicitly forbids faster playback', async () => {
+  const page = await setup(fixture('<div class="ans-attach-ct"><p>未完成任务点前，当前视频不可倍速</p><video></video></div>'));
+  try {
+    page.button.click();
+    await page.step();
+    assert.equal(page.video.playbackRate, 1);
+    assert.equal(page.plays(), 1);
+    assert.match(page.win.document.getElementById('cxpb-status').textContent, /1×.*课程限制/);
+  } finally { page.close(); }
+});
+test('retries at 1x when the player rejects play at a faster rate', async () => {
+  let attempts = 0;
+  const page = await setup(fixture('<div class="ans-attach-ct"><video></video></div>'), (win) => {
+    const video = win.document.querySelector('video');
+    video.play = async () => {
+      attempts += 1;
+      if (video.playbackRate > 1) throw new Error('speed is disabled');
+      win.__setPaused(false);
+    };
+  });
+  try {
+    page.button.click();
+    await page.step();
+    assert.equal(page.video.playbackRate, 1);
+    assert.equal(page.video.paused, false);
+    assert.equal(attempts, 2);
   } finally { page.close(); }
 });
