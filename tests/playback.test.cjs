@@ -401,7 +401,7 @@ async function runQuizFrame(questions, answerForRequest, hasKey = true) {
   let confirms = 0;
   frame.document.querySelector('#quiz-submit').addEventListener('click', () => { submits += 1; });
   frame.document.querySelector('#popok').addEventListener('click', () => { confirms += 1; });
-  for (const question of frame.document.querySelectorAll('.singleQuesId')) {
+  for (const question of frame.document.querySelectorAll('.singleQuesId, .questionLi, div[id^="question"]')) {
     for (const option of question.querySelectorAll('.quiz-option')) {
       option.addEventListener('click', () => {
         const selected = option.querySelector('.num_option');
@@ -495,6 +495,39 @@ test('answers choice and judgment questions only after two matching model respon
   assert.equal(result.requests, 4);
   assert.equal(result.submits, 1);
   assert.equal(result.confirms, 1);
+});
+
+test('answers questions whose containers have question IDs but no legacy question class', async () => {
+  const questions = [
+    '<div id="question1"><div class="Zy_TItle"><span class="newZy_TItle">\u3010\u5355\u9009\u9898\u3011</span><p>Who painted this?</p></div>',
+    '<ul class="Zy_ulTop"><li class="quiz-option"><span class="num_option">A</span><a class="after">Wang Wei</a></li>',
+    '<li class="quiz-option"><span class="num_option">B</span><a class="after">Juran</a></li>',
+    '<li class="quiz-option"><span class="num_option">C</span><a class="after">Wu Daozi</a></li>',
+    '<li class="quiz-option"><span class="num_option">D</span><a class="after">Huang Gongwang</a></li></ul></div>'
+  ].join('');
+  const result = await runQuizFrame(questions, (question) => {
+    assert.match(question.question, /Who painted this/);
+    assert.deepEqual(question.options.map((option) => option.text), ['Wang Wei', 'Juran', 'Wu Daozi', 'Huang Gongwang']);
+    return { answer: ['D'], confidence: 'high' };
+  });
+  assert.equal(result.result.kind, 'submitted');
+  assert.equal(result.requests, 2);
+  assert.equal(result.submits, 1);
+});
+
+test('recognizes the legacy question title label', async () => {
+  const questions = [
+    '<div id="question2" class="questionLi"><h3 class="mark_name"><span class="colorShallow">(\u5355\u9009\u9898)</span>2 + 2?</h3>',
+    '<div class="stem_answer"><div class="answerBg quiz-option"><span class="num_option">A</span>3</div>',
+    '<div class="answerBg quiz-option"><span class="num_option">B</span>4</div></div></div>'
+  ].join('');
+  const result = await runQuizFrame(questions, (question) => {
+    assert.match(question.question, /2 \+ 2/);
+    return { answer: ['B'], confidence: 'high' };
+  });
+  assert.equal(result.result.kind, 'submitted');
+  assert.equal(result.requests, 2);
+  assert.equal(result.submits, 1);
 });
 
 test('does not submit when two model passes disagree', async () => {

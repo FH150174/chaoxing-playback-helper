@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         学习通视频与 PPT 连播助手
 // @namespace    local.chaoxing.playback
-// @version      0.3.0
+// @version      0.3.1
 // @description  顺序处理视频、PPT 与章节习题任务，等待平台完成标记后切换。
 // @homepageURL  https://github.com/FH150174/chaoxing-playback-helper
 // @supportURL   https://github.com/FH150174/chaoxing-playback-helper/issues
@@ -821,9 +821,12 @@
   }
 
   function parseQuizQuestions(doc) {
-    const roots = Array.from(doc.querySelectorAll('div.singleQuesId, .questionLi'))
+    const roots = Array.from(doc.querySelectorAll('div.singleQuesId, .questionLi, div[id^="question"]'))
       .filter((node) => visible(node) &&
-        (!node.matches('.questionLi') || !node.closest('.singleQuesId')));
+        (!node.matches('.questionLi') || !node.closest('.singleQuesId')) &&
+        (node.matches('.singleQuesId, .questionLi') ||
+          (!node.closest('.singleQuesId') &&
+            !node.querySelector('div.singleQuesId, .questionLi, div[id^="question"]'))));
     return roots.map((node, index) => {
       if (node.querySelector('.font-cxsecret')) {
         throw new Error('第 ' + (index + 1) + ' 题使用加密字体，无法可靠读取题干。');
@@ -831,7 +834,7 @@
       if (node.querySelector('img')) {
         throw new Error('第 ' + (index + 1) + ' 题含图片，当前版本无法可靠作答。');
       }
-      const typeText = quizText(node.querySelector('.newZy_TItle')?.textContent ||
+      const typeText = quizText(node.querySelector('.newZy_TItle, .colorShallow')?.textContent ||
         node.getAttribute('typename') || '');
       let type = /多选/.test(typeText) ? 'multi' :
         /单选|判断/.test(typeText) ? 'single' : null;
