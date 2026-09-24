@@ -49,7 +49,7 @@ async function setup(html, beforeScript) {
     await new Promise((resolve) => setImmediate(resolve));
   }
   function close() { dom.window.close(); }
-  return { dom, win, video, button, step, close, plays: () => plays };
+  return { dom, win, video, button, step, close, gmValues, plays: () => plays };
 }
 
 test('plays a pending video at 2x, waits for the finished marker, then opens the next unfinished chapter', async () => {
@@ -95,7 +95,7 @@ test('does not treat an unknown chapter count as completed or skip to it', async
     page.button.click();
     await page.step();
     assert.equal(opened, 0);
-    assert.match(page.win.document.getElementById('cxpb-status').textContent, /没有找到可识别/);
+    assert.match(page.win.document.getElementById('cxpb-status').textContent, /没有后续可处理/);
   } finally { page.close(); }
 });
 
@@ -387,369 +387,130 @@ test('retries at 1x when the player rejects play at a faster rate', async () => 
   } finally { page.close(); }
 });
 
-async function runQuizFrame(questions, answerForRequest, hasKey = true, framePath = '/mooc-ans/work/doHomeWorkNew') {
-  const dom = new JSDOM('<!doctype html><html><body><iframe src="' + framePath + '"></iframe></body></html>', {
-    url: courseUrl, runScripts: 'outside-only', pretendToBeVisual: true
-  });
-  const top = dom.window;
-  const frame = top.document.querySelector('iframe').contentWindow;
-  frame.document.open();
-  frame.document.write('<!doctype html><html><body>' + questions + '<button id="quiz-submit">提交</button><button id="popok">确定</button></body></html>');
-  frame.document.close();
-  let requests = 0;
-  let submits = 0;
-  let confirms = 0;
-  frame.document.querySelector('#quiz-submit').addEventListener('click', () => { submits += 1; });
-  frame.document.querySelector('#popok').addEventListener('click', () => { confirms += 1; });
-  for (const question of frame.document.querySelectorAll('.singleQuesId, .questionLi, div[id^="question"], .TiMu')) {
-    for (const option of question.querySelectorAll('.quiz-option')) {
-      option.addEventListener('click', () => {
-        const selected = option.querySelector('.num_option, input[type="radio"], input[type="checkbox"]') || option;
-        if (selected?.tagName === 'INPUT') {
-          if (selected.type === 'checkbox') selected.checked = !selected.checked;
-          else {
-            for (const other of question.querySelectorAll('input[type="radio"]')) other.checked = false;
-            selected.checked = true;
-          }
-          return;
-        }
-        if (/多选/.test(question.querySelector('.newZy_TItle')?.textContent || '')) {
-          selected.classList.toggle('check_answer');
-        } else {
-          for (const other of question.querySelectorAll('.num_option')) {
-            other.classList.remove('check_answer');
-          }
-          selected.classList.add('check_answer');
-        }
-      });
-    }
-  }
-  frame.setTimeout = (callback) => { queueMicrotask(callback); return 1; };
-  frame.GM_getValue = (key, fallback) => {
-    if (key === 'cxpb-deepseek-api-key' && hasKey) return 'test-api-key';
-    if (key === 'cxpb-quiz-session:200:300') return { token: 'test-token', createdAt: Date.now() };
-    return fallback;
-  };
-  frame.GM_xmlhttpRequest = (details) => {
-    requests += 1;
-    assert.equal(details.url, 'https://api.deepseek.com/chat/completions');
-    assert.equal(details.headers.Authorization, 'Bearer test-api-key');
-    const question = JSON.parse(JSON.parse(details.data).messages[1].content);
-    const answer = answerForRequest(question, requests, frame, top);
-    details.onload({
-      status: 200,
-      responseText: JSON.stringify({
-        choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(answer) } }]
-      })
-    });
-  };
-  frame.eval(script);
-  const result = new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error('quiz frame did not finish')), 1500);
-    top.addEventListener('message', (event) => {
-      if (event.data?.channel !== 'cxpb-quiz-v1' ||
-          !['submitted', 'error'].includes(event.data.kind)) return;
-      clearTimeout(timeout);
-      resolve(event.data);
-    });
-  });
-  frame.dispatchEvent(new frame.MessageEvent('message', {
-    origin: 'https://mooc1.chaoxing.com',
-    source: top,
-    data: { channel: 'cxpb-quiz-v1', action: 'solve', token: 'test-token', sessionKey: 'cxpb-quiz-session:200:300' }
-  }));
-  try {
-    return { result: await result, requests, submits, confirms };
-  } finally {
-    dom.window.close();
-  }
-}
 
-test('sends a start command to a chapter quiz without skipping the task', async () => {
-  const page = await setup(fixture('<div class="ans-attach-ct"><iframe src="/mooc-ans/work/doHomeWorkNew"></iframe></div>'));
+test('skips an unfinished chapter quiz and opens the next chapter without submitting', async () => {
+  const html = fixture('<div class="ans-attach-ct"><iframe src="/mooc-ans/work/doHomeWorkNew"></iframe></div>');
+  const page = await setup(html);
   try {
-    const frame = page.win.document.querySelector('.ans-attach-ct iframe').contentWindow;
-    const commands = [];
-    frame.addEventListener('message', (event) => commands.push(event.data));
+    let opened = 0;
+    const quiz = page.win.document.querySelector('.ans-attach-ct');
+    page.win.document.querySelector('#cur101 .posCatalog_name').addEventListener('click', () => { opened += 1; });
     page.button.click();
     await page.step();
-    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(opened, 1);
     assert.equal(page.button.textContent, '停止连播');
-    assert.equal(commands[0]?.action, 'solve');
-    assert.equal(commands[0]?.channel, 'cxpb-quiz-v1');
-    page.button.click();
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(commands.at(-1)?.action, 'cancel', 'stopping should cancel the quiz frame');
+    assert.equal(quiz.classList.contains('ans-job-finished'), false);
+    assert.match(page.win.document.getElementById('cxpb-status').textContent, /跳过章节测验/);
   } finally { page.close(); }
 });
 
-test('keeps playback enabled and waits at a quiz when parsing fails', async () => {
-  const page = await setup(fixture('<div class="ans-attach-ct"><iframe src="/mooc-ans/work/doHomeWorkNew"></iframe></div>'));
+test('plays a video after a quiz in the same task card', async () => {
+  const html = fixture('<div class="ans-attach-ct"><div class="ans-insertwork"></div></div>' +
+    '<div class="ans-attach-ct"><video></video></div>');
+  const page = await setup(html);
   try {
-    const job = page.win.document.querySelector('.ans-attach-ct');
-    const frame = job.querySelector('iframe').contentWindow;
-    const commands = [];
-    frame.addEventListener('message', (event) => commands.push(event.data));
     page.button.click();
     await page.step();
-    await new Promise((resolve) => setImmediate(resolve));
-    const token = commands.find((command) => command.action === 'solve')?.token;
-    assert.ok(token);
-    page.win.dispatchEvent(new page.win.MessageEvent('message', {
-      source: frame,
-      origin: 'https://mooc1.chaoxing.com',
-      data: { channel: 'cxpb-quiz-v1', token, kind: 'error', message: 'no questions found' }
-    }));
-    assert.equal(page.button.textContent, '\u505c\u6b62\u8fde\u64ad');
-    assert.match(page.win.document.getElementById('cxpb-status').textContent, /no questions found/);
-    const requestCount = commands.length;
-    await page.step();
-    assert.equal(commands.length, requestCount, 'a failed quiz must not be retried every tick');
-    job.classList.add('ans-job-finished');
-    await page.step();
-    assert.equal(page.button.textContent, '\u505c\u6b62\u8fde\u64ad');
+    assert.equal(page.plays(), 1);
+    assert.equal(page.button.textContent, '停止连播');
   } finally { page.close(); }
 });
 
-test('prefers the inner quiz frame when a quiz frame embeds another quiz page', async () => {
-  let inner;
-  const page = await setup(fixture('<div class="ans-attach-ct"><iframe id="outer-quiz" src="/mooc-ans/work/doHomeWorkNew"></iframe></div>'), (win) => {
-    const outerDoc = win.document.getElementById('outer-quiz').contentDocument;
-    outerDoc.open();
-    outerDoc.write('<!doctype html><html><body><iframe src="/mooc-ans/mooc2/work/dowork"></iframe></body></html>');
-    outerDoc.close();
-    inner = outerDoc.querySelector('iframe').contentWindow;
+test('skips a quiz tab and plays the following video tab', async () => {
+  const html = fixture('<div id="quiz-card" class="ans-attach-ct"><div class="ans-insertwork"></div></div>' +
+    '<div id="video-card" class="ans-attach-ct" style="display:none"><video></video></div>')
+    .replace('<li class="active">视频</li>', '<li class="active">测验</li><li>视频</li>');
+  const page = await setup(html);
+  try {
+    const tabs = page.win.document.querySelectorAll('.prev_ul li');
+    let clicked = 0;
+    tabs[1].addEventListener('click', () => {
+      clicked += 1;
+      tabs[0].classList.remove('active');
+      tabs[1].classList.add('active');
+      page.win.document.querySelector('#quiz-card').style.display = 'none';
+      page.win.document.querySelector('#video-card').style.display = '';
+    });
+    page.button.click();
+    await page.step();
+    assert.equal(clicked, 1);
+    await page.step();
+    await page.step();
+    assert.equal(page.plays(), 1);
+  } finally { page.close(); }
+});
+
+test('does not loop back to chapters containing only unfinished quizzes', async () => {
+  const html = fixture('<div class="ans-attach-ct"><div class="ans-insertwork"></div></div>');
+  const page = await setup(html);
+  try {
+    const first = page.win.document.getElementById('cur100');
+    const second = page.win.document.getElementById('cur101');
+    let firstClicks = 0;
+    let secondClicks = 0;
+    first.querySelector('.posCatalog_name').addEventListener('click', () => { firstClicks += 1; });
+    second.querySelector('.posCatalog_name').addEventListener('click', () => {
+      secondClicks += 1;
+      first.classList.remove('posCatalog_active');
+      second.classList.add('posCatalog_active');
+    });
+    page.button.click();
+    await page.step();
+    assert.equal(secondClicks, 1);
+    await page.step();
+    await page.step();
+    assert.equal(firstClicks, 0);
+    assert.equal(secondClicks, 1);
+    assert.equal(page.button.textContent, '开始连播');
+    assert.match(page.win.document.getElementById('cxpb-status').textContent, /测验仍需手动完成/);
+    assert.deepEqual(JSON.parse(page.win.sessionStorage.getItem('cx-playback:200:300:scanned-chapters')), ['cur100', 'cur101']);
+  } finally { page.close(); }
+});
+
+test('keeps scanned chapters across a page reload during playback', async () => {
+  const html = fixture('<div class="ans-attach-ct"><div class="ans-insertwork"></div></div>')
+    .replace('posCatalog_select posCatalog_active" id="cur100"', 'posCatalog_select" id="cur100"')
+    .replace('posCatalog_select" id="cur101"', 'posCatalog_select posCatalog_active" id="cur101"');
+  const page = await setup(html, (win) => {
+    win.sessionStorage.setItem('cx-playback:200:300', JSON.stringify({ enabled: true }));
+    win.sessionStorage.setItem('cx-playback:200:300:scanned-chapters', JSON.stringify(['cur100']));
   });
   try {
-    const outer = page.win.document.getElementById('outer-quiz').contentWindow;
-    const outerCommands = [];
-    const innerCommands = [];
-    outer.addEventListener('message', (event) => outerCommands.push(event.data));
-    inner.addEventListener('message', (event) => innerCommands.push(event.data));
-    page.button.click();
+    let revisits = 0;
+    page.win.document.querySelector('#cur100 .posCatalog_name').addEventListener('click', () => { revisits += 1; });
     await page.step();
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(innerCommands[0]?.action, 'solve');
-    assert.equal(outerCommands.length, 0);
+    assert.equal(revisits, 0);
+    assert.equal(page.button.textContent, '开始连播');
+    assert.deepEqual(JSON.parse(page.win.sessionStorage.getItem('cx-playback:200:300:scanned-chapters')), ['cur100', 'cur101']);
   } finally { page.close(); }
 });
 
-test('answers choice and judgment questions only after two matching model responses', async () => {
-  const questions = [
-    '<div class="singleQuesId" data="q1">',
-    '<div class="newZy_TItle">单选题</div><p>2 + 2 等于几？</p>',
-    '<div class="quiz-option"><span class="num_option">A</span>3</div>',
-    '<div class="quiz-option"><span class="num_option">B</span>4</div>',
-    '</div><div class="singleQuesId" data="q2">',
-    '<div class="newZy_TItle">判断题</div><p>太阳从东方升起。</p>',
-    '<div class="quiz-option"><span class="num_option">A</span>正确</div>',
-    '<div class="quiz-option"><span class="num_option">B</span>错误</div>',
-    '</div>'
-  ].join('');
-  const result = await runQuizFrame(questions, (question) => ({
-    answer: [question.question.includes('2 + 2') ? 'B' : 'A'],
-    confidence: 'high'
-  }));
-  assert.equal(result.result.kind, 'submitted');
-  assert.equal(result.requests, 4);
-  assert.equal(result.submits, 1);
-  assert.equal(result.confirms, 1);
-});
-
-test('answers questions whose containers have question IDs but no legacy question class', async () => {
-  const questions = [
-    '<div id="question1"><div class="Zy_TItle"><span class="newZy_TItle">\u3010\u5355\u9009\u9898\u3011</span><p>Who painted this?</p></div>',
-    '<ul class="Zy_ulTop"><li class="quiz-option"><span class="num_option">A</span><a class="after">Wang Wei</a></li>',
-    '<li class="quiz-option"><span class="num_option">B</span><a class="after">Juran</a></li>',
-    '<li class="quiz-option"><span class="num_option">C</span><a class="after">Wu Daozi</a></li>',
-    '<li class="quiz-option"><span class="num_option">D</span><a class="after">Huang Gongwang</a></li></ul></div>'
-  ].join('');
-  const result = await runQuizFrame(questions, (question) => {
-    assert.match(question.question, /Who painted this/);
-    assert.deepEqual(question.options.map((option) => option.text), ['Wang Wei', 'Juran', 'Wu Daozi', 'Huang Gongwang']);
-    return { answer: ['D'], confidence: 'high' };
-  });
-  assert.equal(result.result.kind, 'submitted');
-  assert.equal(result.requests, 2);
-  assert.equal(result.submits, 1);
-});
-
-test('recognizes the legacy question title label', async () => {
-  const questions = [
-    '<div id="question2" class="questionLi"><h3 class="mark_name"><span class="colorShallow">(\u5355\u9009\u9898)</span>2 + 2?</h3>',
-    '<div class="stem_answer"><div class="answerBg quiz-option"><span class="num_option">A</span>3</div>',
-    '<div class="answerBg quiz-option"><span class="num_option">B</span>4</div></div></div>'
-  ].join('');
-  const result = await runQuizFrame(questions, (question) => {
-    assert.match(question.question, /2 \+ 2/);
-    return { answer: ['B'], confidence: 'high' };
-  });
-  assert.equal(result.result.kind, 'submitted');
-  assert.equal(result.requests, 2);
-  assert.equal(result.submits, 1);
-});
-
-test('answers legacy TiMu chapter quiz questions with input options', async () => {
-  const questions = [
-    '<div class="CeYan"><div class="TiMu"><div class="Zy_TItle clearfix"><div>\u3016\u5355\u9009\u9898\u3017Who painted this?</div></div>',
-    '<ul class="Zy_ulTop"><li class="quiz-option"><input type="radio" name="q1"><a>Wang Wei</a></li>',
-    '<li class="quiz-option"><input type="radio" name="q1"><a>Juran</a></li>',
-    '<li class="quiz-option"><input type="radio" name="q1"><a>Wu Daozi</a></li>',
-    '<li class="quiz-option"><input type="radio" name="q1"><a>Huang Gongwang</a></li></ul></div></div>'
-  ].join('');
-  const result = await runQuizFrame(questions, (question) => {
-    assert.match(question.question, /Who painted this/);
-    assert.deepEqual(question.options.map((option) => option.text), ['Wang Wei', 'Juran', 'Wu Daozi', 'Huang Gongwang']);
-    return { answer: ['D'], confidence: 'high' };
-  }, true, '/mooc-ans/mooc2/work/dowork');
-  assert.equal(result.result.kind, 'submitted', result.result.message);
-  assert.equal(result.requests, 2);
-  assert.equal(result.submits, 1);
-});
-
-test('answers legacy TiMu judgment questions with input options', async () => {
-  const questions = [
-    '<div class="CeYan"><div class="TiMu"><div class="Zy_TItle clearfix"><div>\u3016\u5224\u65ad\u9898\u3017The sun rises in the east.</div></div>',
-    '<ul class="Zy_ulBottom"><li class="quiz-option"><input type="radio" name="q2"><a>True</a></li>',
-    '<li class="quiz-option"><input type="radio" name="q2"><a>False</a></li></ul></div></div>'
-  ].join('');
-  const result = await runQuizFrame(questions, (question) => {
-    assert.equal(question.type, 'single');
-    assert.deepEqual(question.options.map((option) => option.text), ['True', 'False']);
-    return { answer: ['A'], confidence: 'high' };
-  });
-  assert.equal(result.result.kind, 'submitted', result.result.message);
-  assert.equal(result.requests, 2);
-  assert.equal(result.submits, 1);
-});
-
-test('answers legacy TiMu options rendered as clickable rows without input elements', async () => {
-  const questions = [
-    '<div class="TiMu"><div class="Zy_TItle clearfix"><div>\u3016\u5355\u9009\u9898\u3017Which is correct?</div></div>',
-    '<ul class="Zy_ulTop"><li class="quiz-option"><a>Apple</a></li>',
-    '<li class="quiz-option"><a>Banana</a></li></ul></div>'
-  ].join('');
-  const result = await runQuizFrame(questions, (question) => {
-    assert.deepEqual(question.options.map((option) => option.text), ['Apple', 'Banana']);
-    return { answer: ['B'], confidence: 'high' };
-  });
-  assert.equal(result.result.kind, 'submitted', result.result.message);
-  assert.equal(result.submits, 1);
-});
-
-test('reports structural counts when a quiz frame has no recognizable questions', async () => {
-  const result = await runQuizFrame('', () => ({ answer: ['A'], confidence: 'high' }));
-  assert.equal(result.result.kind, 'error');
-  assert.match(result.result.message, /0 \u4e2a/);
-  assert.equal(result.requests, 0);
-  assert.equal(result.submits, 0);
-});
-
-test('does not submit when two model passes disagree', async () => {
-  const questions = [
-    '<div class="singleQuesId" data="q1">',
-    '<div class="newZy_TItle">单选题</div><p>2 + 2 等于几？</p>',
-    '<div class="quiz-option"><span class="num_option">A</span>3</div>',
-    '<div class="quiz-option"><span class="num_option">B</span>4</div>',
-    '</div>'
-  ].join('');
-  const result = await runQuizFrame(questions, (_question, number) => ({
-    answer: [number === 1 ? 'A' : 'B'],
-    confidence: 'high'
-  }));
-  assert.equal(result.result.kind, 'error');
-  assert.match(result.result.message, /两次判断不一致/);
-  assert.equal(result.submits, 0);
-});
-
-test('does not call DeepSeek or submit without a locally configured key', async () => {
-  const questions = [
-    '<div class="singleQuesId" data="q1">',
-    '<div class="newZy_TItle">判断题</div><p>太阳从东方升起。</p>',
-    '<div class="quiz-option"><span class="num_option">A</span>正确</div>',
-    '<div class="quiz-option"><span class="num_option">B</span>错误</div>',
-    '</div>'
-  ].join('');
-  const result = await runQuizFrame(questions, () => ({ answer: ['A'], confidence: 'high' }), false);
-  assert.equal(result.result.kind, 'error');
-  assert.match(result.result.message, /API Key/);
-  assert.equal(result.requests, 0);
-  assert.equal(result.submits, 0);
-});
-
-test('answers all required options in a multiple-choice question', async () => {
-  const questions = [
-    '<div class="singleQuesId" data="q1">',
-    '<div class="newZy_TItle">多选题</div><p>哪些是偶数？</p>',
-    '<div class="quiz-option"><span class="num_option">A</span>2</div>',
-    '<div class="quiz-option"><span class="num_option">B</span>3</div>',
-    '<div class="quiz-option"><span class="num_option">C</span>4</div>',
-    '</div>'
-  ].join('');
-  const result = await runQuizFrame(questions, () => ({
-    answer: ['A', 'C'],
-    confidence: 'high'
-  }));
-  assert.equal(result.result.kind, 'submitted');
-  assert.equal(result.requests, 2);
-  assert.equal(result.submits, 1);
-});
-
-test('cancels before selecting or submitting after the user stops', async () => {
-  const questions = [
-    '<div class="singleQuesId" data="q1">',
-    '<div class="newZy_TItle">单选题</div><p>2 + 2 等于几？</p>',
-    '<div class="quiz-option"><span class="num_option">A</span>3</div>',
-    '<div class="quiz-option"><span class="num_option">B</span>4</div>',
-    '</div>'
-  ].join('');
-  const result = await runQuizFrame(questions, (_question, number, frame, top) => {
-    if (number === 1) {
-      frame.dispatchEvent(new frame.MessageEvent('message', {
-        origin: 'https://mooc1.chaoxing.com',
-        source: top,
-        data: { channel: 'cxpb-quiz-v1', action: 'cancel', token: 'test-token' }
-      }));
-    }
-    return { answer: ['B'], confidence: 'high' };
-  });
-  assert.equal(result.result.kind, 'error');
-  assert.match(result.result.message, /已停止/);
-  assert.equal(result.requests, 1);
-  assert.equal(result.submits, 0);
-});
-
-test('does not submit questions that require unreadable images', async () => {
-  const questions = [
-    '<div class="singleQuesId" data="q1">',
-    '<div class="newZy_TItle">单选题</div><p>图中的数字是什么？<img src="/private.png"></p>',
-    '<div class="quiz-option"><span class="num_option">A</span>3</div>',
-    '<div class="quiz-option"><span class="num_option">B</span>4</div>',
-    '</div>'
-  ].join('');
-  const result = await runQuizFrame(questions, () => ({ answer: ['B'], confidence: 'high' }));
-  assert.equal(result.result.kind, 'error');
-  assert.match(result.result.message, /图片/);
-  assert.equal(result.requests, 0);
-  assert.equal(result.submits, 0);
-});
-
-test('recognizes a quiz iframe nested inside a chapter card', async () => {
-  let quizFrame;
+test('recognizes a quiz iframe nested inside a chapter card and skips it', async () => {
   const page = await setup(fixture('<div class="ans-attach-ct"><iframe id="cards" src="/knowledgecards"></iframe></div>'), (win) => {
-    const cardDoc = win.document.querySelector('#cards').contentDocument;
-    cardDoc.open();
-    cardDoc.write('<!doctype html><html><body><iframe src="/mooc-ans/work/doHomeWorkNew"></iframe></body></html>');
-    cardDoc.close();
-    quizFrame = cardDoc.querySelector('iframe').contentWindow;
+    const doc = win.document.querySelector('#cards').contentDocument;
+    doc.open();
+    doc.write('<!doctype html><html><body><iframe src="/mooc-ans/work/doHomeWorkNew"></iframe></body></html>');
+    doc.close();
   });
   try {
-    const commands = [];
-    quizFrame.addEventListener('message', (event) => commands.push(event.data));
+    let opened = 0;
+    page.win.document.querySelector('#cur101 .posCatalog_name').addEventListener('click', () => { opened += 1; });
     page.button.click();
     await page.step();
-    await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(commands[0]?.action, 'solve');
+    assert.equal(opened, 1);
     assert.equal(page.button.textContent, '停止连播');
+  } finally { page.close(); }
+});
+
+test('removes old API credentials and no longer exposes quiz controls or network permission', async () => {
+  const page = await setup(fixture('<div class="ans-attach-ct"><video></video></div>'), (win) => {
+    win.GM_setValue('cxpb-deepseek-api-key', 'old-secret');
+    win.GM_setValue('cxpb-deepseek-model', 'old-model');
+    win.GM_setValue('cxpb-quiz-session:200:300', { token: 'old-token' });
+  });
+  try {
+    assert.equal(page.gmValues.size, 0);
+    assert.equal(page.win.document.querySelector('#cxpb-key,#cxpb-model'), null);
+    assert.doesNotMatch(script, /@connect\s+api\.deepseek\.com|GM_xmlhttpRequest|requestDeepSeek/);
   } finally { page.close(); }
 });
