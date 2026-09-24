@@ -1,0 +1,295 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const { JSDOM } = require('jsdom');
+
+const script = fs.readFileSync(path.join(__dirname, '..', 'chaoxing-playback.user.js'), 'utf8');
+const courseUrl = 'https://mooc1.chaoxing.com/mycourse/studentstudy?chapterId=100&courseId=200&clazzid=300&mooc2=1';
+
+function fixture(jobMarkup, secondCount = '1') {
+  return `<!doctype html><html><body>
+    <div class="posCatalog_select posCatalog_active" id="cur100"><span class="posCatalog_name">第一章</span><input class="jobUnfinishCount" value="1"></div>
+    <div class="posCatalog_select" id="cur101"><span class="posCatalog_name">第二章</span>${secondCount === null ? '' : `<input class="jobUnfinishCount" value="${secondCount}">`}</div>
+    <ul class="prev_ul"><li class="active">视频</li></ul>
+    ${jobMarkup}
+  </body></html>`;
+}
+
+async function setup(html, beforeScript) {
+  const dom = new JSDOM(html, { url: courseUrl, runScripts: 'outside-only', pretendToBeVisual: true });
+  const win = dom.window;
+  let now = 1000;
+  let interval;
+  let plays = 0;
+  let paused = true;
+  win.Date.now = () => now;
+  win.setInterval = (fn) => { interval = fn; return 1; };
+  win.console.info = () => {};
+  const video = win.document.querySelector('video');
+  if (video) {
+    Object.defineProperty(video, 'paused', { configurable: true, get: () => paused });
+    video.play = async () => { plays += 1; paused = false; };
+  }
+  if (beforeScript) beforeScript(win);
+  win.eval(script);
+  win.document.dispatchEvent(new win.Event('DOMContentLoaded'));
+  await Promise.resolve();
+  const button = win.document.getElementById('cxpb-toggle');
+  assert.ok(button, 'the control panel should be present');
+  async function step(milliseconds = 2000) {
+    await new Promise((resolve) => setImmediate(resolve));
+    now += milliseconds;
+    interval();
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  function close() { dom.window.close(); }
+  return { dom, win, video, button, step, close, plays: () => plays };
+}
+
+test('plays a pending video at 2x, waits for the finished marker, then opens the next unfinished chapter', async () => {
+  const page = await setup(fixture('<div class="ans-attach-ct"><video></video></div>'));
+  try {
+    let opened = 0;
+    page.win.document.querySelector('#cur101 .posCatalog_name').addEventListener('click', () => { opened += 1; });
+    page.button.click();
+    await page.step();
+    assert.equal(page.plays(), 1);
+    assert.equal(page.video.playbackRate, 2);
+    assert.equal(page.video.muted, true);
+    assert.equal(opened, 0, 'video start alone must not advance');
+    Object.defineProperty(page.video, 'ended', { configurable: true, get: () => true });
+    await page.step();
+    assert.equal(opened, 0, 'ended alone must not advance before the platform finishes the task');
+    page.win.document.querySelector('.ans-attach-ct').classList.add('ans-job-finished');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(opened, 1, 'the completion marker should wake playback without waiting for a background timer');
+    await page.step();
+    assert.equal(opened, 1, 'chapter navigation must not be clicked twice');
+  } finally { page.close(); }
+});
+
+test('stops at an unfinished non-video task and does not leave the chapter', async () => {
+  const page = await setup(fixture('<div class="ans-attach-ct"><p>章节测验</p></div>'));
+  try {
+    let opened = 0;
+    page.win.document.querySelector('#cur101 .posCatalog_name').addEventListener('click', () => { opened += 1; });
+    page.button.click();
+    await page.step();
+    assert.match(page.win.document.getElementById('cxpb-status').textContent, /非视频\/PPT任务点/);
+    assert.equal(page.button.textContent, '开始连播');
+    assert.equal(opened, 0);
+  } finally { page.close(); }
+});
+
+test('does not treat an unknown chapter count as completed or skip to it', async () => {
+  const page = await setup(fixture('<div class="ans-attach-ct ans-job-finished"><video></video></div>', null));
+  try {
+    let opened = 0;
+    page.win.document.querySelector('#cur101 .posCatalog_name').addEventListener('click', () => { opened += 1; });
+    page.button.click();
+    await page.step();
+    assert.equal(opened, 0);
+    assert.match(page.win.document.getElementById('cxpb-status').textContent, /没有找到可识别/);
+  } finally { page.close(); }
+});
+
+test('background compatibility follows the toggle and returns native visibility after stopping', async () => {
+  const page = await setup(fixture('<div class="ans-attach-ct"><video></video></div>'));
+  try {
+    const nativeHidden = page.win.document.hidden;
+    page.button.click();
+    assert.equal(page.win.document.hidden, false);
+    assert.equal(page.win.document.visibilityState, 'visible');
+    page.button.click();
+    assert.equal(page.win.document.hidden, nativeHidden);
+  } finally { page.close(); }
+});
+test('finds media inside the visible chapter iframe', async () => {
+  let frameVideo;
+  let plays = 0;
+  const page = await setup(fixture('<iframe id="iframe"></iframe>'), (win) => {
+    const iframeDoc = win.document.getElementById('iframe').contentDocument;
+    iframeDoc.body.innerHTML = '<div class="ans-attach-ct"><video id="video_html5_api"></video></div>';
+    frameVideo = iframeDoc.getElementById('video_html5_api');
+    Object.defineProperty(frameVideo, 'paused', { configurable: true, get: () => true });
+    frameVideo.play = async () => { plays += 1; };
+  });
+  try {
+    page.button.click();
+    await page.step();
+    assert.equal(plays, 1);
+    assert.equal(frameVideo.playbackRate, 2);
+  } finally { page.close(); }
+});
+test('skips a completed chapter even when it contains no playable task card', async () => {
+  const page = await setup(fixture(''));
+  try {
+    page.win.document.querySelector('#cur100 input').value = '0';
+    let opened = 0;
+    page.win.document.querySelector('#cur101 .posCatalog_name').addEventListener('click', () => { opened += 1; });
+    page.button.click();
+    await page.step();
+    assert.equal(opened, 1);
+  } finally { page.close(); }
+});
+
+test('starts its scan from the first task tab when the user opened a later tab', async () => {
+  const html = fixture('<div class="ans-attach-ct"><video></video></div>')
+    .replace('<li class="active">视频</li>', '<li>视频一</li><li class="active">视频二</li>');
+  const page = await setup(html);
+  try {
+    const first = page.win.document.querySelector('.prev_ul li');
+    let clicks = 0;
+    first.addEventListener('click', () => { clicks += 1; });
+    page.button.click();
+    await page.step();
+    assert.equal(clicks, 1);
+    assert.equal(page.plays(), 0);
+  } finally { page.close(); }
+});
+async function setupPptPage(options = {}) {
+  const frameAttributes = options.classMarker
+    ? 'class="ans-attach-online insertdoc-online-ppt"'
+    : 'data="{&quot;module&quot;:&quot;insertdoc&quot;}"';
+  const html = fixture('<div class="ans-attach-ct"><iframe id="ppt-frame" ' + frameAttributes + '></iframe></div>');
+  let position = 0;
+  let height = 700;
+  let viewer;
+  const page = await setup(html, (win) => {
+    let doc = win.document.getElementById('ppt-frame').contentDocument;
+    if (options.nested) {
+      doc.body.innerHTML = '<iframe id="ppt-inner"></iframe>';
+      doc = doc.getElementById('ppt-inner').contentDocument;
+    }
+    doc.body.innerHTML = '<div id="viewerContainer" style="height:200px;overflow-y:auto"></div>';
+    viewer = doc.getElementById('viewerContainer');
+    Object.defineProperty(viewer, 'clientHeight', { get: () => 200 });
+    Object.defineProperty(viewer, 'scrollHeight', { get: () => height });
+    Object.defineProperty(viewer, 'scrollTop', {
+      get: () => position,
+      set: (value) => { position = Math.max(0, Math.min(height - 200, value)); }
+    });
+  });
+  return { page, viewer, getPosition: () => position, grow: (value) => { height = value; } };
+}
+
+test('scrolls a PPT viewer in steps and waits for the real finished marker before advancing', async () => {
+  const ppt = await setupPptPage();
+  const { page } = ppt;
+  try {
+    let opened = 0;
+    page.win.document.querySelector('#cur101 .posCatalog_name').addEventListener('click', () => { opened += 1; });
+    page.button.click();
+    await page.step();
+    assert.equal(ppt.getPosition(), 160);
+    assert.equal(opened, 0);
+    await page.step();
+    assert.equal(ppt.getPosition(), 320);
+    await page.step();
+    await page.step();
+    assert.equal(ppt.getPosition(), 500);
+    await page.step();
+    assert.equal(opened, 0, 'reaching the bottom must not be treated as platform completion');
+    page.win.document.querySelector('.ans-attach-ct').classList.add('ans-job-finished');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(opened, 1);
+  } finally { page.close(); }
+});
+
+test('continues scrolling when a PPT viewer lazy-loads more pages at the bottom', async () => {
+  const ppt = await setupPptPage();
+  const { page } = ppt;
+  try {
+    page.button.click();
+    await page.step();
+    await page.step();
+    await page.step();
+    await page.step();
+    assert.equal(ppt.getPosition(), 500);
+    ppt.grow(1000);
+    await page.step();
+    assert.ok(ppt.getPosition() > 500);
+    assert.equal(page.button.textContent, '停止连播');
+  } finally { page.close(); }
+});
+
+test('stops when a PPT task has no accessible scroll area', async () => {
+  const html = fixture('<div class="ans-attach-ct"><iframe data="{&quot;module&quot;:&quot;insertdoc&quot;}"></iframe></div>');
+  const page = await setup(html);
+  try {
+    page.button.click();
+    await page.step();
+    await page.step(21000);
+    assert.match(page.win.document.getElementById('cxpb-status').textContent, /未找到可访问的 PPT 滚动区域/);
+    assert.equal(page.button.textContent, '开始连播');
+  } finally { page.close(); }
+});
+test('scrolls a PPT rendered directly on the course page', async () => {
+  const html = fixture('<div class="ans-attach-ct"><div class="ans-insertdoc">课件</div></div>');
+  const page = await setup(html, (win) => {
+    const root = win.document.documentElement;
+    Object.defineProperty(root, 'clientHeight', { get: () => 200 });
+    Object.defineProperty(root, 'scrollHeight', { get: () => 600 });
+  });
+  try {
+    page.button.click();
+    await page.step();
+    assert.equal(page.win.document.documentElement.scrollTop, 160);
+  } finally { page.close(); }
+});
+test('recognizes the insertdoc-online PPT marker and scrolls through a second iframe', async () => {
+  const ppt = await setupPptPage({ classMarker: true, nested: true });
+  try {
+    ppt.page.button.click();
+    await ppt.page.step();
+    assert.equal(ppt.getPosition(), 160);
+  } finally { ppt.page.close(); }
+});
+test('keeps 2x playback when a course resets speed and pauses on ratechange', async () => {
+  let blockedPauses = 0;
+  const page = await setup(fixture('<div class="ans-attach-ct"><video></video></div>'), (win) => {
+    const video = win.document.querySelector('video');
+    video.pause = () => { blockedPauses += 1; };
+    video.addEventListener('ratechange', () => {
+      if (video.playbackRate > 1) {
+        video.playbackRate = 1;
+        video.pause();
+      }
+    });
+  });
+  try {
+    page.button.click();
+    await page.step();
+    page.video.dispatchEvent(new page.win.Event('ratechange'));
+    assert.equal(page.video.playbackRate, 2);
+    assert.equal(blockedPauses, 0, 'the course ratechange handler should not pause the active task');
+
+    page.button.click();
+    page.video.dispatchEvent(new page.win.Event('ratechange'));
+    assert.equal(blockedPauses, 1, 'the course listener should work again after stopping');
+  } finally { page.close(); }
+});
+test('guards 2x playback inside a chapter iframe', async () => {
+  let frameVideo;
+  let courseResets = 0;
+  const page = await setup(fixture('<iframe id="video-frame"></iframe>'), (win) => {
+    const frameDoc = win.document.getElementById('video-frame').contentDocument;
+    frameDoc.body.innerHTML = '<div class="ans-attach-ct"><video></video></div>';
+    frameVideo = frameDoc.querySelector('video');
+    Object.defineProperty(frameVideo, 'paused', { get: () => false });
+    frameVideo.addEventListener('ratechange', () => {
+      if (frameVideo.playbackRate > 1) {
+        courseResets += 1;
+        frameVideo.playbackRate = 1;
+      }
+    });
+  });
+  try {
+    page.button.click();
+    await page.step();
+    frameVideo.dispatchEvent(new page.win.Event('ratechange'));
+    assert.equal(frameVideo.playbackRate, 2);
+    assert.equal(courseResets, 0);
+  } finally { page.close(); }
+});
