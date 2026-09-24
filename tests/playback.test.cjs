@@ -26,6 +26,10 @@ async function setup(html, beforeScript) {
   win.Date.now = () => now;
   win.setInterval = (fn) => { interval = fn; return 1; };
   win.console.info = () => {};
+  const gmValues = new Map();
+  win.GM_getValue = (key, fallback) => gmValues.has(key) ? gmValues.get(key) : fallback;
+  win.GM_setValue = (key, value) => gmValues.set(key, value);
+  win.GM_deleteValue = (key) => gmValues.delete(key);
   win.__setPaused = (value) => { paused = value; };
   const video = win.document.querySelector('video');
   if (video) {
@@ -71,7 +75,7 @@ test('plays a pending video at 2x, waits for the finished marker, then opens the
 });
 
 test('stops at an unfinished non-video task and does not leave the chapter', async () => {
-  const page = await setup(fixture('<div class="ans-attach-ct"><p>章节测验</p></div>'));
+  const page = await setup(fixture('<div class="ans-attach-ct"><p>无法识别的互动任务</p></div>'));
   try {
     let opened = 0;
     page.win.document.querySelector('#cur101 .posCatalog_name').addEventListener('click', () => { opened += 1; });
@@ -380,5 +384,224 @@ test('retries at 1x when the player rejects play at a faster rate', async () => 
     assert.equal(page.video.playbackRate, 1);
     assert.equal(page.video.paused, false);
     assert.equal(attempts, 2);
+  } finally { page.close(); }
+});
+
+async function runQuizFrame(questions, answerForRequest, hasKey = true) {
+  const dom = new JSDOM('<!doctype html><html><body><iframe src="/mooc-ans/work/doHomeWorkNew"></iframe></body></html>', {
+    url: courseUrl, runScripts: 'outside-only', pretendToBeVisual: true
+  });
+  const top = dom.window;
+  const frame = top.document.querySelector('iframe').contentWindow;
+  frame.document.open();
+  frame.document.write('<!doctype html><html><body>' + questions + '<button id="quiz-submit">提交</button><button id="popok">确定</button></body></html>');
+  frame.document.close();
+  let requests = 0;
+  let submits = 0;
+  let confirms = 0;
+  frame.document.querySelector('#quiz-submit').addEventListener('click', () => { submits += 1; });
+  frame.document.querySelector('#popok').addEventListener('click', () => { confirms += 1; });
+  for (const question of frame.document.querySelectorAll('.singleQuesId')) {
+    for (const option of question.querySelectorAll('.quiz-option')) {
+      option.addEventListener('click', () => {
+        const selected = option.querySelector('.num_option');
+        if (/多选/.test(question.querySelector('.newZy_TItle')?.textContent || '')) {
+          selected.classList.toggle('check_answer');
+        } else {
+          for (const other of question.querySelectorAll('.num_option')) {
+            other.classList.remove('check_answer');
+          }
+          selected.classList.add('check_answer');
+        }
+      });
+    }
+  }
+  frame.setTimeout = (callback) => { queueMicrotask(callback); return 1; };
+  frame.GM_getValue = (key, fallback) => {
+    if (key === 'cxpb-deepseek-api-key' && hasKey) return 'test-api-key';
+    if (key === 'cxpb-quiz-session:200:300') return { token: 'test-token', createdAt: Date.now() };
+    return fallback;
+  };
+  frame.GM_xmlhttpRequest = (details) => {
+    requests += 1;
+    assert.equal(details.url, 'https://api.deepseek.com/chat/completions');
+    assert.equal(details.headers.Authorization, 'Bearer test-api-key');
+    const question = JSON.parse(JSON.parse(details.data).messages[1].content);
+    const answer = answerForRequest(question, requests, frame, top);
+    details.onload({
+      status: 200,
+      responseText: JSON.stringify({
+        choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(answer) } }]
+      })
+    });
+  };
+  frame.eval(script);
+  const result = new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('quiz frame did not finish')), 1500);
+    top.addEventListener('message', (event) => {
+      if (event.data?.channel !== 'cxpb-quiz-v1' ||
+          !['submitted', 'error'].includes(event.data.kind)) return;
+      clearTimeout(timeout);
+      resolve(event.data);
+    });
+  });
+  frame.dispatchEvent(new frame.MessageEvent('message', {
+    origin: 'https://mooc1.chaoxing.com',
+    source: top,
+    data: { channel: 'cxpb-quiz-v1', action: 'solve', token: 'test-token', sessionKey: 'cxpb-quiz-session:200:300' }
+  }));
+  try {
+    return { result: await result, requests, submits, confirms };
+  } finally {
+    dom.window.close();
+  }
+}
+
+test('sends a start command to a chapter quiz without skipping the task', async () => {
+  const page = await setup(fixture('<div class="ans-attach-ct"><iframe src="/mooc-ans/work/doHomeWorkNew"></iframe></div>'));
+  try {
+    const frame = page.win.document.querySelector('.ans-attach-ct iframe').contentWindow;
+    const commands = [];
+    frame.addEventListener('message', (event) => commands.push(event.data));
+    page.button.click();
+    await page.step();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(page.button.textContent, '停止连播');
+    assert.equal(commands[0]?.action, 'solve');
+    assert.equal(commands[0]?.channel, 'cxpb-quiz-v1');
+    page.button.click();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(commands.at(-1)?.action, 'cancel', 'stopping should cancel the quiz frame');
+  } finally { page.close(); }
+});
+
+test('answers choice and judgment questions only after two matching model responses', async () => {
+  const questions = [
+    '<div class="singleQuesId" data="q1">',
+    '<div class="newZy_TItle">单选题</div><p>2 + 2 等于几？</p>',
+    '<div class="quiz-option"><span class="num_option">A</span>3</div>',
+    '<div class="quiz-option"><span class="num_option">B</span>4</div>',
+    '</div><div class="singleQuesId" data="q2">',
+    '<div class="newZy_TItle">判断题</div><p>太阳从东方升起。</p>',
+    '<div class="quiz-option"><span class="num_option">A</span>正确</div>',
+    '<div class="quiz-option"><span class="num_option">B</span>错误</div>',
+    '</div>'
+  ].join('');
+  const result = await runQuizFrame(questions, (question) => ({
+    answer: [question.question.includes('2 + 2') ? 'B' : 'A'],
+    confidence: 'high'
+  }));
+  assert.equal(result.result.kind, 'submitted');
+  assert.equal(result.requests, 4);
+  assert.equal(result.submits, 1);
+  assert.equal(result.confirms, 1);
+});
+
+test('does not submit when two model passes disagree', async () => {
+  const questions = [
+    '<div class="singleQuesId" data="q1">',
+    '<div class="newZy_TItle">单选题</div><p>2 + 2 等于几？</p>',
+    '<div class="quiz-option"><span class="num_option">A</span>3</div>',
+    '<div class="quiz-option"><span class="num_option">B</span>4</div>',
+    '</div>'
+  ].join('');
+  const result = await runQuizFrame(questions, (_question, number) => ({
+    answer: [number === 1 ? 'A' : 'B'],
+    confidence: 'high'
+  }));
+  assert.equal(result.result.kind, 'error');
+  assert.match(result.result.message, /两次判断不一致/);
+  assert.equal(result.submits, 0);
+});
+
+test('does not call DeepSeek or submit without a locally configured key', async () => {
+  const questions = [
+    '<div class="singleQuesId" data="q1">',
+    '<div class="newZy_TItle">判断题</div><p>太阳从东方升起。</p>',
+    '<div class="quiz-option"><span class="num_option">A</span>正确</div>',
+    '<div class="quiz-option"><span class="num_option">B</span>错误</div>',
+    '</div>'
+  ].join('');
+  const result = await runQuizFrame(questions, () => ({ answer: ['A'], confidence: 'high' }), false);
+  assert.equal(result.result.kind, 'error');
+  assert.match(result.result.message, /API Key/);
+  assert.equal(result.requests, 0);
+  assert.equal(result.submits, 0);
+});
+
+test('answers all required options in a multiple-choice question', async () => {
+  const questions = [
+    '<div class="singleQuesId" data="q1">',
+    '<div class="newZy_TItle">多选题</div><p>哪些是偶数？</p>',
+    '<div class="quiz-option"><span class="num_option">A</span>2</div>',
+    '<div class="quiz-option"><span class="num_option">B</span>3</div>',
+    '<div class="quiz-option"><span class="num_option">C</span>4</div>',
+    '</div>'
+  ].join('');
+  const result = await runQuizFrame(questions, () => ({
+    answer: ['A', 'C'],
+    confidence: 'high'
+  }));
+  assert.equal(result.result.kind, 'submitted');
+  assert.equal(result.requests, 2);
+  assert.equal(result.submits, 1);
+});
+
+test('cancels before selecting or submitting after the user stops', async () => {
+  const questions = [
+    '<div class="singleQuesId" data="q1">',
+    '<div class="newZy_TItle">单选题</div><p>2 + 2 等于几？</p>',
+    '<div class="quiz-option"><span class="num_option">A</span>3</div>',
+    '<div class="quiz-option"><span class="num_option">B</span>4</div>',
+    '</div>'
+  ].join('');
+  const result = await runQuizFrame(questions, (_question, number, frame, top) => {
+    if (number === 1) {
+      frame.dispatchEvent(new frame.MessageEvent('message', {
+        origin: 'https://mooc1.chaoxing.com',
+        source: top,
+        data: { channel: 'cxpb-quiz-v1', action: 'cancel', token: 'test-token' }
+      }));
+    }
+    return { answer: ['B'], confidence: 'high' };
+  });
+  assert.equal(result.result.kind, 'error');
+  assert.match(result.result.message, /已停止/);
+  assert.equal(result.requests, 1);
+  assert.equal(result.submits, 0);
+});
+
+test('does not submit questions that require unreadable images', async () => {
+  const questions = [
+    '<div class="singleQuesId" data="q1">',
+    '<div class="newZy_TItle">单选题</div><p>图中的数字是什么？<img src="/private.png"></p>',
+    '<div class="quiz-option"><span class="num_option">A</span>3</div>',
+    '<div class="quiz-option"><span class="num_option">B</span>4</div>',
+    '</div>'
+  ].join('');
+  const result = await runQuizFrame(questions, () => ({ answer: ['B'], confidence: 'high' }));
+  assert.equal(result.result.kind, 'error');
+  assert.match(result.result.message, /图片/);
+  assert.equal(result.requests, 0);
+  assert.equal(result.submits, 0);
+});
+
+test('recognizes a quiz iframe nested inside a chapter card', async () => {
+  let quizFrame;
+  const page = await setup(fixture('<div class="ans-attach-ct"><iframe id="cards" src="/knowledgecards"></iframe></div>'), (win) => {
+    const cardDoc = win.document.querySelector('#cards').contentDocument;
+    cardDoc.open();
+    cardDoc.write('<!doctype html><html><body><iframe src="/mooc-ans/work/doHomeWorkNew"></iframe></body></html>');
+    cardDoc.close();
+    quizFrame = cardDoc.querySelector('iframe').contentWindow;
+  });
+  try {
+    const commands = [];
+    quizFrame.addEventListener('message', (event) => commands.push(event.data));
+    page.button.click();
+    await page.step();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(commands[0]?.action, 'solve');
+    assert.equal(page.button.textContent, '停止连播');
   } finally { page.close(); }
 });
