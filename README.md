@@ -2,17 +2,17 @@
 
 适用于 Chrome + Tampermonkey 的用户脚本。它在学习通电脑端依次处理当前课程中可识别的未完成视频、音频和 PPT/文档任务点：视频可选择 1×、1.5× 或 2×，PPT 在可访问的阅读区域内逐屏下滑。脚本只在页面显示任务完成标记后切换到下一项。
 
-[查看脚本源码](chaoxing-playback.user.js)
+[安装或更新脚本](https://raw.githubusercontent.com/FH150174/chaoxing-playback-helper/main/chaoxing-playback.user.js) · [查看源码](chaoxing-playback.user.js)
 
 ## 安装与使用
 
 1. 在 Chrome 中安装 Tampermonkey。
-2. 在本仓库打开 chaoxing-playback.user.js，复制全部内容，粘贴到 Tampermonkey 的新建脚本中并保存。仓库目前为私有，脚本不配置公开更新地址；后续更新需重新复制。
+2. 点击上方“安装或更新脚本”，按 Tampermonkey 提示安装。如果浏览器只显示源码，可复制全部内容并粘贴到 Tampermonkey 的新建脚本中。
 3. 如果之前手动安装过旧版，先停用旧脚本，避免两个版本同时运行；确认新版正常后可删除旧版。
 4. 刷新学习通电脑端课程学习页，点击右下角“开始连播”。默认选择 2×、静音自动播放和后台兼容。
 5. 首次使用先观察一个视频和一个 PPT，确认任务点确实显示“已完成”。需要停止时，点击“停止连播”。
 
-脚本配置仅保存在当前浏览器标签页的该课程会话中。
+脚本配置仅保存在当前浏览器标签页的该课程会话中。通过安装链接安装的脚本可由 Tampermonkey 按更新地址检查新版本。
 
 ## 工作范围与限制
 

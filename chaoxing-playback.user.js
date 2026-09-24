@@ -1,10 +1,12 @@
 // ==UserScript==
-// @name         学习通视频与 PPT 连播助手（本地）
+// @name         学习通视频与 PPT 连播助手
 // @namespace    local.chaoxing.playback
-// @version      0.2.1
+// @version      0.2.2
 // @description  顺序处理未完成的视频与 PPT 任务，等待平台完成标记后切换。
 // @homepageURL  https://github.com/FH150174/chaoxing-playback-helper
 // @supportURL   https://github.com/FH150174/chaoxing-playback-helper/issues
+// @updateURL    https://raw.githubusercontent.com/FH150174/chaoxing-playback-helper/main/chaoxing-playback.user.js
+// @downloadURL  https://raw.githubusercontent.com/FH150174/chaoxing-playback-helper/main/chaoxing-playback.user.js
 // @license      MIT
 // @match        https://*.chaoxing.com/*
 // @run-at       document-start
